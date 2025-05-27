@@ -3,13 +3,21 @@ local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 
--- Configuration
-local HERB_NAME = "Medicinal Herb"
-local COLLECT_KEY = Enum.KeyCode.E
-local COLLECT_DURATION = 2
-local SEARCH_INTERVAL = 3
-local REACH_DISTANCE = 5
-local PATHFINDING_TIMEOUT = 7
+-- Auto-detection configuration
+local TARGET_NAME = "Medicinal Herb"
+local SEARCH_RADIUS = 200
+local INTERACTION_TYPES = {
+    HOLD_E = {
+        key = Enum.KeyCode.E,
+        duration = 2
+    },
+    CLICK = {
+        detector_class = "ClickDetector"
+    },
+    PROXIMITY = {
+        range = 10
+    }
+}
 
 -- Initialize character
 local localPlayer = Players.LocalPlayer
@@ -17,44 +25,116 @@ local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid")
 local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
 
--- Herb detection with proximity check
-local function findNearestHerb()
-    local closestHerb, closestDistance = nil, math.huge
+-- Debug visualization
+local function createMarker(target, color)
+    if target:FindFirstChild("HERB_DEBUG_MARKER") then return end
     
-    for _, item in ipairs(workspace:GetDescendants()) do
-        if item.Name == HERB_NAME and item:IsA("BasePart") then
-            local distance = (humanoidRootPart.Position - item.Position).Magnitude
-            if distance < closestDistance then
-                closestHerb = item
-                closestDistance = distance
+    local marker = Instance.new("BoxHandleAdornment")
+    marker.Name = "HERB_DEBUG_MARKER"
+    marker.Adornee = target
+    marker.AlwaysOnTop = true
+    marker.Size = target:IsA("BasePart") and target.Size or target.PrimaryPart.Size
+    marker.Color3 = color or Color3.fromRGB(0, 255, 0)
+    marker.Transparency = 0.7
+    marker.ZIndex = 10
+    marker.Parent = target
+    return marker
+end
+
+-- Advanced target finding
+local function findTarget()
+    local candidates = {}
+    
+    for _, descendant in ipairs(workspace:GetDescendants()) do
+        if descendant.Name:find(TARGET_NAME) then
+            if descendant:IsA("BasePart") or descendant:IsA("Model") then
+                local validTarget = false
+                local primaryPart = nil
+                local position = nil
+                
+                if descendant:IsA("Model") then
+                    primaryPart = descendant.PrimaryPart or descendant:FindFirstChildWhichIsA("BasePart")
+                    if primaryPart then
+                        position = primaryPart.Position
+                        validTarget = true
+                    end
+                else
+                    position = descendant.Position
+                    validTarget = true
+                end
+                
+                if validTarget and (humanoidRootPart.Position - position).Magnitude <= SEARCH_RADIUS then
+                    table.insert(candidates, {
+                        object = descendant,
+                        primaryPart = primaryPart,
+                        position = position
+                    })
+                end
             end
         end
     end
     
-    return closestHerb
+    -- Find nearest candidate
+    local nearest = nil
+    local minDistance = math.huge
+    
+    for _, candidate in ipairs(candidates) do
+        local distance = (humanoidRootPart.Position - candidate.position).Magnitude
+        if distance < minDistance then
+            minDistance = distance
+            nearest = candidate
+        end
+    end
+    
+    return nearest
 end
 
--- Smooth pathfinding with obstacle avoidance
-local function navigateTo(target)
+-- Smart interaction detection
+local function determineInteractionMethod(target)
+    -- Method 1: Check for ClickDetector
+    local clickDetector = target.object:FindFirstChildOfClass("ClickDetector") 
+                    or (target.primaryPart and target.primaryPart:FindFirstChildOfClass("ClickDetector"))
+    
+    if clickDetector then
+        createMarker(target.object, Color3.fromRGB(255, 0, 0))
+        return "CLICK", clickDetector
+    end
+    
+    -- Method 2: Check for ProximityPrompt
+    local proximityPrompt = target.object:FindFirstChildOfClass("ProximityPrompt")
+                    or (target.primaryPart and target.primaryPart:FindFirstChildOfClass("ProximityPrompt"))
+    
+    if proximityPrompt then
+        createMarker(target.object, Color3.fromRGB(0, 0, 255))
+        return "PROMPT", proximityPrompt
+    end
+    
+    -- Method 3: Default to Hold E
+    createMarker(target.object, Color3.fromRGB(0, 255, 0))
+    return "HOLD_E"
+end
+
+-- Pathfinding with obstacle avoidance
+local function navigateTo(position)
     local path = PathfindingService:CreatePath({
-        AgentRadius = 1.5,
+        AgentRadius = 1,
         AgentHeight = 5,
         AgentCanJump = true,
         AgentCanClimb = true
     })
     
-    path:ComputeAsync(humanoidRootPart.Position, target.Position)
+    path:ComputeAsync(humanoidRootPart.Position, position)
     
     if path.Status == Enum.PathStatus.Success then
         local waypoints = path:GetWaypoints()
         
-        for i = 2, #waypoints do -- Skip first waypoint
+        for i = 2, #waypoints do
             humanoid:MoveTo(waypoints[i].Position)
             
             local startTime = os.clock()
-            while (humanoidRootPart.Position - waypoints[i].Position).Magnitude > 2.5 do
-                if os.clock() - startTime > PATHFINDING_TIMEOUT then
-                    humanoid:MoveTo(humanoidRootPart.Position) -- Cancel movement
+            while (humanoidRootPart.Position - waypoints[i].Position).Magnitude > 3 do
+                if os.clock() - startTime > 5 then
+                    humanoid:MoveTo(humanoidRootPart.Position)
                     return false
                 end
                 RunService.Heartbeat:Wait()
@@ -65,66 +145,81 @@ local function navigateTo(target)
     return false
 end
 
--- Realistic collection interaction
-local function collectHerb(herb)
-    -- Face the herb naturally
-    local targetPosition = Vector3.new(herb.Position.X, humanoidRootPart.Position.Y, herb.Position.Z)
-    humanoidRootPart.CFrame = CFrame.lookAt(humanoidRootPart.Position, targetPosition)
+-- Interaction handlers
+local interactionHandlers = {
+    CLICK = function(target, detector)
+        fireclickdetector(detector)
+        print("Collected via ClickDetector")
+        return true
+    end,
     
-    -- Simulate key press with human-like delay
-    wait(math.random(0.1, 0.3))
+    PROMPT = function(target, prompt)
+        prompt:InputHoldBegin()
+        wait(prompt.HoldDuration)
+        prompt:InputHoldEnd()
+        print("Collected via ProximityPrompt")
+        return true
+    end,
     
-    -- Hold E with slight randomness
-    local actualDuration = COLLECT_DURATION * (0.9 + math.random() * 0.2) -- 90-110% of duration
-    UserInputService:SetKeysDown({COLLECT_KEY})
-    
-    local startTime = os.clock()
-    while os.clock() - startTime < actualDuration do
-        if (humanoidRootPart.Position - herb.Position).Magnitude > REACH_DISTANCE + 2 then
-            UserInputService:SetKeysUp({COLLECT_KEY})
-            return false -- Moved too far away
+    HOLD_E = function(target)
+        -- Face the target
+        humanoidRootPart.CFrame = CFrame.lookAt(
+            humanoidRootPart.Position,
+            Vector3.new(target.position.X, humanoidRootPart.Position.Y, target.position.Z)
+        )
+        
+        -- Hold E
+        local startTime = os.clock()
+        UserInputService:SetKeysDown({INTERACTION_TYPES.HOLD_E.key})
+        
+        while os.clock() - startTime < INTERACTION_TYPES.HOLD_E.duration do
+            if (humanoidRootPart.Position - target.position).Magnitude > 10 then
+                UserInputService:SetKeysUp({INTERACTION_TYPES.HOLD_E.key})
+                return false
+            end
+            RunService.Heartbeat:Wait()
         end
-        RunService.Heartbeat:Wait()
+        
+        UserInputService:SetKeysUp({INTERACTION_TYPES.HOLD_E.key})
+        print("Collected via Hold E")
+        return true
+    end
+}
+
+-- Main collection system
+local function attemptCollection()
+    local target = findTarget()
+    
+    if not target then
+        print("No target found within range")
+        return false
     end
     
-    UserInputService:SetKeysUp({COLLECT_KEY})
-    return true
+    local interactionType, interactionTarget = determineInteractionMethod(target)
+    
+    -- Navigate to target if not in range
+    if (humanoidRootPart.Position - target.position).Magnitude > 10 then
+        if not navigateTo(target.position) then
+            print("Pathfinding failed")
+            return false
+        end
+    end
+    
+    -- Attempt interaction
+    if interactionHandlers[interactionType] then
+        return interactionHandlers[interactionType](target, interactionTarget)
+    end
+    
+    return false
 end
 
--- Main collection loop with cooldown
-local lastCollectionTime = 0
-local COLLECTION_COOLDOWN = 10
-
+-- Main loop with cooldown
 while true do
-    local currentTime = os.clock()
+    local success, err = pcall(attemptCollection)
     
-    if currentTime - lastCollectionTime >= COLLECTION_COOLDOWN then
-        local herb = findNearestHerb()
-        
-        if herb then
-            local distance = (humanoidRootPart.Position - herb.Position).Magnitude
-            
-            if distance > REACH_DISTANCE then
-                if navigateTo(herb) then
-                    if collectHerb(herb) then
-                        lastCollectionTime = os.clock()
-                        print("Successfully collected:", HERB_NAME)
-                        wait(math.random(2, 4)) -- Random pause between actions
-                    end
-                end
-            else
-                if collectHerb(herb) then
-                    lastCollectionTime = os.clock()
-                    print("Collected nearby herb")
-                end
-            end
-        else
-            print("No herbs found. Searching again in", SEARCH_INTERVAL, "seconds")
-        end
-    else
-        local remainingCooldown = math.floor(COLLECTION_COOLDOWN - (currentTime - lastCollectionTime))
-        print("On cooldown. Ready in", remainingCooldown, "seconds")
+    if not success then
+        warn("Error during collection:", err)
     end
     
-    wait(SEARCH_INTERVAL)
+    wait(3) -- Search cooldown
 end
